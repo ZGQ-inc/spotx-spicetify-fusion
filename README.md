@@ -173,9 +173,9 @@ graph TD
 4. **Rspack Chunk Registration**: Injects all `spicetify-routes-*.js` into Rspack's internal chunk map (`.u`) and MiniCss whitelist.
 5. **Rspack Global Hooking**: Updates `spicetifyWrapper.js` to hook `window.rspackChunk || window.rspackChunkclient_web`, ensuring `Spicetify.React` and `Spicetify.ReactDOM` are correctly bound.
 6. **Dynamic `Spicetify.URI`**: Reconnects the URI parser directly from Spotify's internal module table.
-7. **1.2.x Marketplace route/nav/stylesheet restore** ([fix-marketplace-nav.ps1](fix-marketplace-nav.ps1)): re-applies the lazy chunk, `/marketplace/*` route, nav icon and `miniCss` allowlist into the `xpui.js` the client actually loads — and into Spicetify's staging copies so it survives `spicetify apply`. Root cause in the section below.
+7. **1.2.x Marketplace route/nav/stylesheet restore** (built into `fix.ps1`'s Section B5, same anchors as the standalone [fix-marketplace-nav.ps1](fix-marketplace-nav.ps1)): re-applies the lazy chunk, `/marketplace/*` route, nav icon and `miniCss` allowlist into the `xpui.js` the client actually loads — and into Spicetify's staging copies so it survives `spicetify apply`. Runs automatically whenever `spicetify-routes-marketplace.js` is present; gated on the anchors matching exactly once per file rather than on Spotify's version string (see root cause below for why). Root cause in the section below.
 
-### Spotify 1.2.x: Marketplace icon / route missing after `spicetify apply` (root cause + standalone fix)
+### Spotify 1.2.x: Marketplace icon / route missing after `spicetify apply` (root cause + fix)
 
 On a SpotX-patched **1.2.x** client, `spicetify apply` prints `success` at every step, extensions and themes work, but
 custom apps (Marketplace) never load: no nav icon, no `/marketplace` route. Root cause, traced in
@@ -192,8 +192,8 @@ custom apps (Marketplace) never load: no nav icon, no `/marketplace` route. Root
 4. `insertCustomAppChunkMap` targets `xpui-snapshot.js`, which doesn't exist, so it no-ops — and that is the function
    holding the `miniCss` stylesheet allowlist. Without it the app can load but renders completely unstyled.
 
-[fix-marketplace-nav.ps1](fix-marketplace-nav.ps1) applies the four patches Spicetify would have applied, directly
-into the `xpui.js` that actually loads:
+`fix.ps1`'s Section B5 (and, standalone, [fix-marketplace-nav.ps1](fix-marketplace-nav.ps1)) applies the four
+patches Spicetify would have applied, directly into the `xpui.js` that actually loads:
 
 | Patch | Effect |
 |---|---|
@@ -203,19 +203,61 @@ into the `xpui.js` that actually loads:
 | `"spicetify-routes-marketplace":1` in `a.f.miniCss` | lets its stylesheet load |
 
 ```powershell
-# close Spotify first
+# close Spotify first - this now happens automatically as part of the regular hotfix:
+iwr -useb https://spicetify.zgqinc.gq/fix.ps1 | iex
+
+# or standalone, if you only want this one fix:
 powershell -ExecutionPolicy Bypass -File .\fix-marketplace-nav.ps1
 ```
 
 Properties:
 
-- **Persists across `spicetify apply`**: with no arguments it patches the live bundle *and* Spicetify's staging copies
+- **Runs automatically**: `fix.ps1` applies this whenever it finds `spicetify-routes-marketplace.js` installed, with
+  no separate step or flag needed. The standalone script remains available if you only want this one fix.
+- **Persists across `spicetify apply`**: it patches the live bundle *and* Spicetify's staging copies
   (`spicetify\Extracted\Raw|Themed\xpui\xpui.js`), so the next `apply` re-emits a patched bundle.
 - **Idempotent and self-verifying**: each edit has a marker (skip if present) and a unique anchor; if an anchor
   matches ≠ 1 times (Spotify bundle changed) the file is left untouched and the script says so.
+- **Not gated on Spotify's version string**: `fix.ps1`'s `$is130OrAbove` detection has a string-content fallback
+  (`xpui.js` containing `rspackChunk`) that can misfire on a genuine 1.2.x build — this client's chunk loader global
+  can be named `rspackChunkclient_web` well before the 1.3.0 Rspack migration. Section B5 instead trusts only the
+  per-file anchor match count, so it safely no-ops on an actual 1.3.0+ bundle (different minified identifiers)
+  without relying on that flag.
 - **Backed up**: first write saves `<file>.prenav.bak`. Full undo: `spicetify restore backup apply`.
-- Verified on Spotify `1.2.99.317.g9bd8c54d` + Spicetify `2.44.0`, Windows 11 (2026-09-07). Re-run after a Spotify
-  update, `spicetify apply` / `backup apply` / `restore`, or a Spicetify upgrade.
+- Verified on Spotify `1.2.99.317.g9bd8c54d` + Spicetify `2.44.0`–`2.45.3`, Windows 11 (2026-09-07, re-verified
+  2026-10-07). Re-run after a Spotify update, `spicetify apply` / `backup apply` / `restore`, or a Spicetify upgrade —
+  or just re-run `fix.ps1`, which now covers it.
+
+Two further issues surfaced while re-verifying against Spicetify 2.45.3 (both now fixed, confirmed live via Chrome
+DevTools Protocol against the actual running client, not just string matching):
+
+- **Nav icon call crashed the whole app on launch**: `spicetifyWrapper.js`'s `_renderNavLinks` calls
+  `Spicetify.React.useReducer(...)` as its very first line, before its own "are the deps ready" guard.
+  `Spicetify.React` is resolved asynchronously (`[spicetifyWrapper] Waiting for required webpack modules to load`),
+  so calling it unguarded on the nav bar's first render — which happens synchronously at boot, before that resolves —
+  threw `Cannot read properties of undefined (reading 'useReducer')`, uncaught, tripping xpui's top-level error
+  boundary into a full-page "Something went wrong" on every launch. The nav icon edit now wraps the call in a
+  `try/catch` (same pattern as the `useNavigateStable` fix in `fix.ps1` Section B2); the failed attempt never reaches
+  React's dispatcher, so no hook-order bookkeeping happens, and the sidebar's frequent natural re-renders retry it
+  automatically once `Spicetify.React` is actually set.
+- **Marketplace chunk registered on the wrong global, so it never loaded** (`fix.ps1` Section D, pre-existing, not
+  introduced by this fix): Section D rewrites every custom-app bundle's chunk-registration header to push its module
+  onto a hardcoded `global.rspackChunk` array. On this build xpui.js's own runtime reads from `rspackChunkclient_web`
+  instead — a different global — so `spicetify-routes-marketplace.js` downloaded and executed fine but its module
+  never reached the loader, surfacing as `ChunkLoadError: Loading chunk spicetify-routes-marketplace failed. (missing:
+  ...)` on every navigation to Marketplace despite the file being reachable. Section D now detects the actual global
+  name from `xpui.js` itself (matching the `typeof self?self:global).<name>=` pattern) instead of hardcoding it.
+
+#### Marketplace shows only the "Installed" tab — Themes/Extensions/Snippets/Apps missing
+
+This is **not a bug in this repo's scripts** and no `fix.ps1` re-run will change it — it's a Marketplace setting, not
+broken state in `xpui.js`. Marketplace fetches its Themes/Extensions/Snippets/Apps catalogs from GitHub's search API
+(10 requests/minute, unauthenticated), and if one of those calls ever gets rate-limited, Marketplace **permanently
+disables that tab** and saves the decision to its own IndexedDB database (`spicetify-marketplace` → `settings` →
+key `marketplace:tabs`, a `{name, enabled}` list) — it does not retry or re-enable itself once the rate limit clears.
+
+**Fix**: open Marketplace, click the gear icon (⚙️, "Marketplace Settings") next to the search bar, and re-enable
+the missing tabs there. No file edit or `fix.ps1` re-run needed.
 
 ## 📚 Investigative Blog Articles (In-Depth Technical Deep Dive)
 

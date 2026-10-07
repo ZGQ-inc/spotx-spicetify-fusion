@@ -17,6 +17,10 @@
     4. Spotify 1.2.x compatibility:
        - Fixes SpotX index.html redirection dropping xpui-snapshot.js
        - Normalizes v8_context_snapshot.bin casing from SpotX commit 9fa954a
+       - Restores the Marketplace nav icon, /marketplace route and stylesheet
+         that Spicetify's apply.go never wires up when xpui-snapshot.js is
+         missing, patching the live bundle and Spicetify's staging copies so
+         it survives the next `spicetify apply` (see fix-marketplace-nav.ps1)
 .LINK
     https://github.com/ZGQ-inc/spotx-spicetify-fusion
 #>
@@ -40,7 +44,7 @@ function Write-Log {
     }
 }
 
-Write-Log " SpotX + Spicetify Unified Compatibility Hotfix (v2.1)" "Cyan"
+Write-Log " SpotX + Spicetify Unified Compatibility Hotfix (v2.2)" "Cyan"
 Write-Log " Supports Spotify 1.2.x (Webpack) & 1.3.x+ (Rspack)" "Cyan"
 Write-Log " GitHub: https://github.com/ZGQ-inc/spotx-spicetify-fusion" "Cyan"
 
@@ -86,6 +90,18 @@ if (Test-Path $SpotifyExe) {
 }
 
 $xpuiContent = [System.IO.File]::ReadAllText($xpuiJs, [System.Text.Encoding]::UTF8)
+
+# The chunk-registration global xpui.js's own runtime actually reads (e.g.
+# rspackChunkclient_web, webpackChunkclient_web, or bare rspackChunk - this has
+# been observed to vary by build independently of the 1.2.x/1.3.x version
+# split). Section D needs the real name: pushing a custom-app bundle's module
+# onto the wrong global means the loader's "did this chunk register?" check
+# never passes, so it throws ChunkLoadError "missing" even though the file
+# downloaded fine - the app simply never saw its own module.
+$chunkGlobalName = 'rspackChunk'
+if ($xpuiContent -match 'typeof self\?self:global\)\.(\w+)=') {
+    $chunkGlobalName = $Matches[1]
+}
 
 $is130OrAbove = $false
 if ($detectedVersion -ne "unknown" -and $detectedVersion -match '^1\.([3-9]|\d{2,})\.') {
@@ -189,6 +205,100 @@ if ($customAppBundles.Count -gt 0) {
     }
 }
 
+# B5: restore Marketplace nav icon / route / stylesheet on the pre-1.3.0
+# webpack-style bundle shape. SpotX points index.html at /xpui.js and drops
+# xpui-snapshot.js, so Spicetify's apply.go rewrite (gated on
+# <script src="/xpui-snapshot.js">) never fires and the custom-app patches
+# below never reach the xpui.js the client actually loads.
+#
+# Deliberately NOT gated on $is130OrAbove: that flag's rspackChunk string
+# fallback has been observed to misfire on genuine 1.2.x builds (the chunk
+# loader global can be named rspackChunkclient_web even on a pre-1.3.0
+# bundle), which would skip this section on exactly the installs it targets.
+# Only runs if the marketplace custom app is actually installed, and only
+# touches a file if all four anchors are present exactly once - on a real
+# 1.3.0+ Rspack bundle the minified identifiers differ and the anchors simply
+# won't match, so this safely no-ops there instead of relying on version
+# detection.
+if ($customAppBundles -contains "marketplace") {
+    Write-Log "[*] Restoring Marketplace nav/route (1.2.x xpui-snapshot.js workaround)..." "Cyan"
+
+    $navEdits = @(
+        @{
+            Name   = 'lazy component'
+            Marker = 'spicetifyApp0=D.lazy'
+            Find   = 'return{default:e}}),ok=()=>'
+            Repl   = 'return{default:e}}),spicetifyApp0=D.lazy((()=>i.e("spicetify-routes-marketplace").then(i.bind(i,"spicetify-routes-marketplace")))),ok=()=>'
+        },
+        @{
+            Name   = 'route'
+            Marker = 'path:"/marketplace/*"'
+            Find   = '(0,y.jsx)(eO.qh,{path:"/settings",element:(0,y.jsx)(_x.$,{to:"/"})})'
+            Repl   = '(0,y.jsx)(eO.qh,{path:"/marketplace/*",pathV6:"/marketplace/*",element:(0,y.jsx)(spicetifyApp0,{})}),(0,y.jsx)(eO.qh,{path:"/settings",element:(0,y.jsx)(_x.$,{to:"/"})})'
+        },
+        @{
+            # spicetifyWrapper.js's _renderNavLinks calls Spicetify.React.useReducer as
+            # its very first line, before its own "are the deps ready" guard.
+            # Spicetify.React resolves asynchronously, after the nav bar's first
+            # (synchronous, boot-time) render - calling this unguarded throws and trips
+            # xpui's top-level error boundary into "Something went wrong" on every
+            # launch. try/catch discards that one failed attempt (it never reaches
+            # React's dispatcher, so no hook bookkeeping happens) and relies on the
+            # sidebar's frequent natural re-renders to retry once ready. Same pattern as
+            # the useNavigateStable fix in Section B2 above.
+            Name   = 'nav icon'
+            Marker = '_renderNavLinks(["marketplace"'
+            Find   = 'c&&(0,y.jsxs)(dh,{children:[o?(0,y.jsx)(d_,{}):(0,y.jsx)(dm,{}),(0,y.jsx)(dl,{className:dt})'
+            Repl   = 'c&&(0,y.jsxs)(dh,{children:[o?(0,y.jsx)(d_,{}):(0,y.jsx)(dm,{}),(0,y.jsx)(dl,{className:dt}),(()=>{try{return Spicetify._renderNavLinks(["marketplace",], true)}catch(err){return null}})()'
+        },
+        @{
+            Name   = 'stylesheet allowlist'
+            Marker = '"spicetify-routes-marketplace":1'
+            Find   = 'a.f.miniCss=function(e,t){if(d[e])t.push(d[e]);else 0!==d[e]&&({'
+            Repl   = 'a.f.miniCss=function(e,t){if(d[e])t.push(d[e]);else 0!==d[e]&&({"spicetify-routes-marketplace":1,'
+        }
+    )
+
+    $navTargets = @(
+        $xpuiJs
+        "$env:APPDATA\spicetify\Extracted\Raw\xpui\xpui.js"
+        "$env:APPDATA\spicetify\Extracted\Themed\xpui\xpui.js"
+    ) | Select-Object -Unique | Where-Object { Test-Path $_ }
+
+    foreach ($navPath in $navTargets) {
+        $isLive = ($navPath -eq $xpuiJs)
+        $navText = if ($isLive) { $xpuiContent } else { [System.IO.File]::ReadAllText($navPath, [System.Text.Encoding]::UTF8) }
+
+        $navTodo = @()
+        $navAbort = $false
+        foreach ($e in $navEdits) {
+            if ($navText.Contains($e.Marker)) { continue }
+            $count = 0; $i = 0
+            while (($i = $navText.IndexOf($e.Find, $i)) -ge 0) { $count++; $i += $e.Find.Length }
+            if ($count -ne 1) {
+                Write-Log ("  [-] Marketplace nav anchor '{0}' matched {1}x in {2} - left untouched" -f $e.Name, $count, (Split-Path $navPath -Leaf)) "Yellow"
+                $navAbort = $true
+                break
+            }
+            $navTodo += $e
+        }
+
+        if ($navAbort -or $navTodo.Count -eq 0) { continue }
+
+        $navBak = "$navPath.prenav.bak"
+        if (-not (Test-Path $navBak)) { Copy-Item $navPath $navBak }
+        foreach ($e in $navTodo) { $navText = $navText.Replace($e.Find, $e.Repl) }
+
+        if ($isLive) {
+            $xpuiContent = $navText
+            $xpuiPatched = $true
+        } else {
+            [System.IO.File]::WriteAllText($navPath, $navText, (New-Object System.Text.UTF8Encoding($false)))
+        }
+        Write-Log ("  [+] Restored Marketplace nav icon/route/stylesheet in {0}" -f $navPath) "Green"
+    }
+}
+
 if ($xpuiPatched) {
     [System.IO.File]::WriteAllText($xpuiJs, $xpuiContent, (New-Object System.Text.UTF8Encoding($false)))
     Write-Log "[SUCCESS] xpui.js successfully patched!" "Green"
@@ -230,12 +340,12 @@ if (Test-Path $wrapperJs) {
 
 # SECTION D: Fix custom apps push headers in spicetify-routes-*.js
 if ($routeFiles.Count -gt 0) {
-    Write-Log "[*] Inspecting custom app route bundles..." "Cyan"
+    Write-Log ("[*] Inspecting custom app route bundles (chunk global: {0})..." -f $chunkGlobalName) "Cyan"
     foreach ($rf in $routeFiles) {
         $rc = [System.IO.File]::ReadAllText($rf.FullName, [System.Text.Encoding]::UTF8)
         $pushIdx = $rc.IndexOf(').push([[')
         if ($pushIdx -gt 0 -and $pushIdx -lt 300) {
-            $fixedHead = '(("u">typeof self?self:global).rspackChunk||=[]' + $rc.Substring($pushIdx)
+            $fixedHead = "((""u"">typeof self?self:global).$chunkGlobalName||=[]" + $rc.Substring($pushIdx)
             [System.IO.File]::WriteAllText($rf.FullName, $fixedHead, (New-Object System.Text.UTF8Encoding($false)))
             Write-Log "  [+] Fixed bundle push chain for $($rf.Name)" "Green"
         }

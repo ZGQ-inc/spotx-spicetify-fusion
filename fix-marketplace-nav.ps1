@@ -69,10 +69,23 @@ $edits = @(
         Repl   = '(0,y.jsx)(eO.qh,{path:"/marketplace/*",pathV6:"/marketplace/*",element:(0,y.jsx)(spicetifyApp0,{})}),(0,y.jsx)(eO.qh,{path:"/settings",element:(0,y.jsx)(_x.$,{to:"/"})})'
     },
     @{
+        # spicetifyWrapper.js's _renderNavLinks calls Spicetify.React.useReducer as
+        # its very first line, before its own "are the deps ready" guard. Spicetify.React
+        # is resolved asynchronously ("[spicetifyWrapper] Waiting for required webpack
+        # modules to load"), so calling this unguarded on the nav bar's first render
+        # (which happens synchronously at boot, before that resolves) throws
+        # "Cannot read properties of undefined (reading 'useReducer')" - uncaught,
+        # which trips xpui's top-level error boundary into "Something went wrong" on
+        # every launch. The try/catch throws away that one failed attempt (it never
+        # reaches React's dispatcher - Spicetify.React.useReducer fails on the
+        # property read, so no hook bookkeeping happens) and relies on the sidebar's
+        # frequent natural re-renders (playback ticks, etc.) to retry once
+        # Spicetify.React is actually set. Same pattern as the useNavigateStable fix
+        # in fix.ps1 Section B2.
         Name   = 'nav icon'
         Marker = '_renderNavLinks(["marketplace"'
         Find   = 'c&&(0,y.jsxs)(dh,{children:[o?(0,y.jsx)(d_,{}):(0,y.jsx)(dm,{}),(0,y.jsx)(dl,{className:dt})'
-        Repl   = 'c&&(0,y.jsxs)(dh,{children:[o?(0,y.jsx)(d_,{}):(0,y.jsx)(dm,{}),(0,y.jsx)(dl,{className:dt}),Spicetify._renderNavLinks(["marketplace",], true)'
+        Repl   = 'c&&(0,y.jsxs)(dh,{children:[o?(0,y.jsx)(d_,{}):(0,y.jsx)(dm,{}),(0,y.jsx)(dl,{className:dt}),(()=>{try{return Spicetify._renderNavLinks(["marketplace",], true)}catch(err){return null}})()'
     },
     @{
         # Without this the route's stylesheet is never fetched and Marketplace
